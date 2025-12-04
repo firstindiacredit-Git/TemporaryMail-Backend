@@ -1,7 +1,15 @@
-const API_BASE =
-  (import.meta.env && import.meta.env.VITE_API_BASE_URL
-    ? import.meta.env.VITE_API_BASE_URL.replace(/\/+$/, "")
-    : "") || "";
+// Get API base URL from environment variables
+// In production, this should be set to your backend URL
+// In development, it defaults to empty string (relative paths)
+const getApiBase = () => {
+  if (import.meta.env?.VITE_API_BASE_URL) {
+    return import.meta.env.VITE_API_BASE_URL.replace(/\/+$/, "");
+  }
+  // In production build, use relative paths if not specified
+  return "";
+};
+
+const API_BASE = getApiBase();
 
 export const api = {
   async createMailbox() {

@@ -1,5 +1,8 @@
 import express from "express";
 import cors from "cors";
+import compression from "compression";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import { v4 as uuid } from "uuid";
 import dayjs from "dayjs";
 import path from "path";
@@ -8,33 +11,20 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Handle unhandled promise rejections globally
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("[Unhandled Rejection]", {
-    reason: reason?.message || String(reason),
-    stack: reason?.stack?.split("\n").slice(0, 5).join("\n"),
-  });
-});
-
-// Handle uncaught exceptions
-process.on("uncaughtException", (error) => {
-  console.error("[Uncaught Exception]", {
-    message: error.message,
-    stack: error.stack?.split("\n").slice(0, 5).join("\n"),
-  });
-  // Don't exit in serverless - let Vercel handle it
-  if (!process.env.VERCEL) {
-    process.exit(1);
-  }
-});
-
 const app = express();
 
+// Environment configuration
+const isProduction = process.env.NODE_ENV === "production";
+const isVercel = process.env.VERCEL === "1";
+const PORT = process.env.PORT || 3000;
+const MAIL_TM_BASE_URL = process.env.MAIL_TM_BASE_URL || "https://api.mail.tm";
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+
+// Application constants
 const MAILBOX_TTL_MINUTES = 15;
 const CLEANUP_INTERVAL_MS = 60 * 1000;
 const MAILBOX_LOCAL_PART_LENGTH = 10;
 const PASSWORD_LENGTH = 24;
-const MAIL_TM_BASE_URL = process.env.MAIL_TM_BASE_URL || "https://api.mail.tm";
 const DOMAIN_CACHE_TTL_MS = 10 * 60 * 1000;
 
 let domainRotationIndex = 0;
@@ -628,20 +618,69 @@ const provisionMailboxWithMailTm = async (preferredDomain) => {
   throw new Error(errorMessage);
 };
 
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-API-Key"],
-    credentials: false,
-  })
-);
+// Security middleware
+if (isProduction) {
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'self'"],
+          styleSrc: ["'self'", "'unsafe-inline'"],
+          scriptSrc: ["'self'"],
+          imgSrc: ["'self'", "data:", "https:"],
+        },
+      },
+      crossOriginEmbedderPolicy: false,
+    })
+  );
+}
 
+// Compression middleware
+app.use(compression());
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: isProduction ? 100 : 1000, // Limit each IP to 100 requests per windowMs in production
+  message: {
+    error: "Too many requests from this IP, please try again later.",
+    status: 429,
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use("/api/", limiter);
+
+// CORS configuration
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (CORS_ORIGIN === "*") {
+      callback(null, true);
+    } else if (!origin) {
+      callback(null, true); // Allow requests with no origin (mobile apps, curl, etc.)
+    } else {
+      const allowedOrigins = CORS_ORIGIN.split(",").map((o) => o.trim());
+      if (allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    }
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-API-Key"],
+  credentials: false,
+  maxAge: 86400, // 24 hours
+};
+
+app.use(cors(corsOptions));
+
+// Body parsing middleware
 app.use(express.json({ limit: "100kb" }));
+app.use(express.urlencoded({ extended: true, limit: "100kb" }));
 
 // Only serve static files in non-serverless environments
-const isVercel = process.env.VERCEL === "1";
-const isProduction = process.env.NODE_ENV === "production";
 
 if (!isVercel) {
   const staticPath = isProduction
@@ -660,7 +699,13 @@ app.get("/", (_req, res) => {
 });
 
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", mailboxes: mailboxes.size });
+  res.json({
+    status: "ok",
+    mailboxes: mailboxes.size,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+    environment: isProduction ? "production" : "development",
+  });
 });
 
 const buildMailboxResponse = (mailbox) => ({
@@ -716,18 +761,14 @@ const createMailbox = async (preferredDomain) => {
   return mailbox;
 };
 
-// Only run cleanup interval in non-serverless environments
-// Serverless functions don't maintain state between invocations
-if (!process.env.VERCEL) {
-  setInterval(() => {
-    const now = dayjs();
-    mailboxes.forEach((mailbox, mailboxId) => {
-      if (now.isAfter(mailbox.expiresAt)) {
-        mailboxes.delete(mailboxId);
-      }
-    });
-  }, CLEANUP_INTERVAL_MS).unref();
-}
+setInterval(() => {
+  const now = dayjs();
+  mailboxes.forEach((mailbox, mailboxId) => {
+    if (now.isAfter(mailbox.expiresAt)) {
+      mailboxes.delete(mailboxId);
+    }
+  });
+}, CLEANUP_INTERVAL_MS).unref();
 
 app.post("/api/mailboxes", async (req, res, next) => {
   try {
@@ -825,38 +866,33 @@ app.use((err, req, res, _next) => {
   // Sanitize error messages to remove technical details like IDs
   let errorMessage = err.message || "Unexpected error";
 
-  // For 500 errors, ALWAYS return the user-friendly message first
-  if (status >= 500) {
-    errorMessage =
-      "Mailbox provider service error. Please try again in a few moments.";
-  } else {
-    // Handle mail.tm specific error messages for non-500 errors
-    if (errorMessage.includes("mail.tm request failed")) {
-      const statusMatch = errorMessage.match(/\((\d+)\)/);
-      const errorStatus = statusMatch ? parseInt(statusMatch[1]) : status;
+  // Handle mail.tm specific error messages
+  if (errorMessage.includes("mail.tm request failed")) {
+    const statusMatch = errorMessage.match(/\((\d+)\)/);
+    const errorStatus = statusMatch ? parseInt(statusMatch[1]) : status;
 
-      if (errorStatus === 404) {
-        errorMessage =
-          "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
-      } else {
-        errorMessage =
-          "Unable to create mailbox at this time. Please try again.";
-      }
+    if (errorStatus >= 500) {
+      errorMessage =
+        "Mailbox provider service error. Please try again in a few moments.";
+    } else if (errorStatus === 404) {
+      errorMessage =
+        "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
+    } else {
+      errorMessage = "Unable to create mailbox at this time. Please try again.";
     }
+  }
 
-    // Remove technical error IDs and codes from error messages
-    if (errorMessage.includes("ID:") || errorMessage.includes("Code:")) {
-      // If error contains structured format like "404: NOT_FOUND\n\nCode: NOT_FOUND\n\nID: ..."
-      if (errorMessage.includes("NOT_FOUND") || status === 404) {
-        errorMessage =
-          "The requested resource was not found. Please try again.";
-      } else if (errorMessage.toLowerCase().includes("not_found")) {
-        errorMessage =
-          "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
-      } else {
-        // Extract just the main error message, remove ID and Code lines
-        errorMessage = errorMessage.split("\n")[0].replace(/^\d+:\s*/, "");
-      }
+  // Remove technical error IDs and codes from error messages
+  if (errorMessage.includes("ID:") || errorMessage.includes("Code:")) {
+    // If error contains structured format like "404: NOT_FOUND\n\nCode: NOT_FOUND\n\nID: ..."
+    if (errorMessage.includes("NOT_FOUND") || status === 404) {
+      errorMessage = "The requested resource was not found. Please try again.";
+    } else if (errorMessage.toLowerCase().includes("not_found")) {
+      errorMessage =
+        "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
+    } else {
+      // Extract just the main error message, remove ID and Code lines
+      errorMessage = errorMessage.split("\n")[0].replace(/^\d+:\s*/, "");
     }
   }
 
@@ -890,9 +926,16 @@ if (isProduction && !isVercel) {
 export default app;
 
 // Start server only if not in serverless environment (local development)
-if (!process.env.VERCEL) {
-  const PORT = process.env.PORT || 3000;
+if (!isVercel) {
   app.listen(PORT, () => {
     console.log(`Temp mail service listening on http://localhost:${PORT}`);
+    console.log(`Environment: ${isProduction ? "production" : "development"}`);
+    if (isProduction) {
+      console.log(
+        `CORS Origin: ${
+          CORS_ORIGIN === "*" ? "All origins allowed" : CORS_ORIGIN
+        }`
+      );
+    }
   });
 }

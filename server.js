@@ -58,82 +58,137 @@ const mailboxes = new Map(); // mailboxId -> { address, domain, createdAt, expir
 
 const mailTmRequest = async (
   pathFragment,
-  { method = "GET", headers = {}, body } = {}
+  { method = "GET", headers = {}, body, retries = 0, maxRetries = 2 } = {}
 ) => {
-  const response = await fetch(`${MAIL_TM_BASE_URL}${pathFragment}`, {
-    method,
-    headers: {
-      Accept: "application/ld+json",
-      ...(body ? { "Content-Type": "application/json" } : {}),
-      ...headers,
-    },
-    body,
-  });
+  // Create timeout controller
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
 
-  const text = await response.text();
-  let data;
   try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = null;
-  }
+    const response = await fetch(`${MAIL_TM_BASE_URL}${pathFragment}`, {
+      method,
+      headers: {
+        Accept: "application/ld+json",
+        ...(body ? { "Content-Type": "application/json" } : {}),
+        ...headers,
+      },
+      body,
+      signal: controller.signal,
+    });
 
-  if (!response.ok) {
-    // Handle cases where mail.tm returns an HTML "NOT_FOUND" page instead of JSON
-    let messageFromRemote =
-      data?.detail ||
-      data?.message ||
-      `mail.tm request failed (${response.status})`;
+    clearTimeout(timeoutId); // Clear timeout on successful response
 
-    const lowerText = (text || "").toLowerCase();
+    const text = await response.text();
+    let data;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
 
-    // Handle structured text errors with Code and ID fields
-    if (text && !data) {
-      // Check for structured error format like "404: NOT_FOUND\n\nCode: NOT_FOUND\n\nID: ..."
-      const codeMatch = text.match(/Code:\s*(\w+)/i);
-      const notFoundMatch = text.match(/NOT_FOUND/i);
+    if (!response.ok) {
+      // Retry on 500 errors with exponential backoff
+      if (response.status >= 500 && retries < maxRetries) {
+        const delay = Math.min(1000 * Math.pow(2, retries), 5000); // Exponential backoff, max 5s
+        console.log(
+          `[mail.tm Retry] ${pathFragment} - Status ${
+            response.status
+          }, retrying in ${delay}ms (attempt ${retries + 1}/${maxRetries})`
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        return mailTmRequest(pathFragment, {
+          method,
+          headers,
+          body,
+          retries: retries + 1,
+          maxRetries,
+        });
+      }
 
-      if (codeMatch || notFoundMatch || lowerText.includes("not_found")) {
+      // Handle cases where mail.tm returns an HTML "NOT_FOUND" page instead of JSON
+      let messageFromRemote =
+        data?.detail ||
+        data?.message ||
+        `mail.tm request failed (${response.status})`;
+
+      const lowerText = (text || "").toLowerCase();
+
+      // Handle structured text errors with Code and ID fields
+      if (text && !data) {
+        // Check for structured error format like "404: NOT_FOUND\n\nCode: NOT_FOUND\n\nID: ..."
+        const codeMatch = text.match(/Code:\s*(\w+)/i);
+        const notFoundMatch = text.match(/NOT_FOUND/i);
+
+        if (codeMatch || notFoundMatch || lowerText.includes("not_found")) {
+          messageFromRemote =
+            "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
+        } else if (response.status === 404) {
+          messageFromRemote = "Requested resource not found. Please try again.";
+        } else if (response.status >= 500) {
+          messageFromRemote =
+            "Mailbox provider service error. Please try again in a few moments.";
+        }
+      } else if (
+        lowerText.includes("not_found") ||
+        lowerText.includes("the page could not be found") ||
+        data?.code === "NOT_FOUND"
+      ) {
+        // Normalize the message so frontend doesn't see raw HTML / opaque IDs
         messageFromRemote =
           "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
-      } else if (response.status === 404) {
-        messageFromRemote = "Requested resource not found. Please try again.";
       } else if (response.status >= 500) {
         messageFromRemote =
           "Mailbox provider service error. Please try again in a few moments.";
       }
-    } else if (
-      lowerText.includes("not_found") ||
-      lowerText.includes("the page could not be found") ||
-      data?.code === "NOT_FOUND"
-    ) {
-      // Normalize the message so frontend doesn't see raw HTML / opaque IDs
-      messageFromRemote =
-        "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
-    } else if (response.status >= 500) {
-      messageFromRemote =
-        "Mailbox provider service error. Please try again in a few moments.";
+
+      // Log error details for debugging (server-side only)
+      console.error(`[mail.tm Error] ${pathFragment}`, {
+        status: response.status,
+        message: messageFromRemote,
+        hasData: !!data,
+        textSnippet: text ? text.slice(0, 100) : null,
+        retries,
+      });
+
+      const error = new Error(messageFromRemote);
+      error.status = response.status;
+      error.data = data;
+      // Preserve a small snippet of the raw body for server-side debugging
+      if (!data && text) {
+        error.rawBodySnippet = text.slice(0, 200);
+      }
+      throw error;
     }
 
-    // Log error details for debugging (server-side only)
-    console.error(`[mail.tm Error] ${pathFragment}`, {
-      status: response.status,
-      message: messageFromRemote,
-      hasData: !!data,
-      textSnippet: text ? text.slice(0, 100) : null,
-    });
-
-    const error = new Error(messageFromRemote);
-    error.status = response.status;
-    error.data = data;
-    // Preserve a small snippet of the raw body for server-side debugging
-    if (!data && text) {
-      error.rawBodySnippet = text.slice(0, 200);
+    return data;
+  } catch (error) {
+    clearTimeout(timeoutId); // Clean up timeout
+    // Handle timeout and network errors with retry
+    if (
+      (error.name === "AbortError" ||
+        error.name === "TimeoutError" ||
+        error.name === "TypeError") &&
+      retries < maxRetries
+    ) {
+      const delay = Math.min(1000 * Math.pow(2, retries), 5000);
+      console.log(
+        `[mail.tm Retry] ${pathFragment} - Network/timeout error, retrying in ${delay}ms (attempt ${
+          retries + 1
+        }/${maxRetries})`
+      );
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      return mailTmRequest(pathFragment, {
+        method,
+        headers,
+        body,
+        retries: retries + 1,
+        maxRetries,
+      });
     }
     throw error;
+  } finally {
+    clearTimeout(timeoutId); // Ensure cleanup happens
   }
-
-  return data;
 };
 
 const getAvailableDomains = async () => {
@@ -535,10 +590,15 @@ const provisionMailboxWithMailTm = async (preferredDomain) => {
 
   domainRotationIndex = (domainRotationIndex + 1) % domainsToTry.length;
 
-  const errorMessage =
-    rateLimitedDomains >= maxDomainsToTry - 2
-      ? "Unable to allocate mailbox. All domains are currently rate-limited. Please wait a few seconds and try again."
-      : "Unable to allocate mailbox at this time. Please try again in a few moments.";
+  // Check if we had server errors (500+) vs rate limits
+  let errorMessage;
+  if (rateLimitedDomains >= maxDomainsToTry - 2) {
+    errorMessage =
+      "Unable to allocate mailbox. All domains are currently rate-limited. Please wait a few seconds and try again.";
+  } else {
+    errorMessage =
+      "Unable to allocate mailbox at this time. The email service may be temporarily unavailable. Please try again in a few moments.";
+  }
 
   console.error(
     `[Domain Rotation] Failed after trying ${maxDomainsToTry} domains. ${rateLimitedDomains} were rate-limited.`

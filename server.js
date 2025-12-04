@@ -141,13 +141,25 @@ const getAvailableDomains = async () => {
   if (cachedDomains.items.length && cachedDomains.expiresAt > now) {
     return cachedDomains.items;
   }
-  const payload = await mailTmRequest("/domains");
-  const domains = payload?.["hydra:member"] || [];
-  cachedDomains = {
-    items: domains,
-    expiresAt: now + DOMAIN_CACHE_TTL_MS,
-  };
-  return domains;
+  try {
+    const payload = await mailTmRequest("/domains");
+    const domains = payload?.["hydra:member"] || [];
+    cachedDomains = {
+      items: domains,
+      expiresAt: now + DOMAIN_CACHE_TTL_MS,
+    };
+    return domains;
+  } catch (error) {
+    // If domain fetch fails but we have cached domains, use those
+    if (cachedDomains.items.length > 0) {
+      console.warn(
+        `[Domain Fetch Error] Using cached domains. Error: ${error.message}`
+      );
+      return cachedDomains.items;
+    }
+    // If no cached domains and fetch fails, throw
+    throw error;
+  }
 };
 
 const normalizeDomainEntry = (entry) => {
@@ -454,6 +466,20 @@ const provisionMailboxWithMailTm = async (preferredDomain) => {
           refreshToken: auth.refreshToken,
         };
       } catch (error) {
+        // If server error (500+), try next domain with delay
+        if (error.status >= 500) {
+          console.log(
+            `[Domain Rotation] Server error (${error.status}) on ${domain}, trying next domain...`
+          );
+          // Add delay before trying next domain for server errors
+          if (domainOffset < maxDomainsToTry - 1) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, 200 + Math.random() * 300)
+            );
+          }
+          break; // Break inner loop, try next domain
+        }
+
         // If rate limited (429), add delay and try next domain
         if (error.status === 429) {
           rateLimitedDomains++;

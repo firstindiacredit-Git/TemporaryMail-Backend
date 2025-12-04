@@ -209,12 +209,18 @@ const getAvailableDomains = async () => {
     return cachedDomains.items;
   }
   try {
-    const payload = await mailTmRequest("/domains");
+    // Use more retries for domain fetching as it's critical
+    const payload = await mailTmRequest("/domains", { maxRetries: 5 });
     const domains = payload?.["hydra:member"] || [];
     cachedDomains = {
       items: domains,
       expiresAt: now + DOMAIN_CACHE_TTL_MS,
     };
+    if (domains.length > 0) {
+      console.log(
+        `[Domain Cache] Fetched ${domains.length} domains from mail.tm API`
+      );
+    }
     return domains;
   } catch (error) {
     // If domain fetch fails but we have cached domains, use those
@@ -222,10 +228,16 @@ const getAvailableDomains = async () => {
       console.warn(
         `[Domain Fetch Error] Using cached domains. Error: ${error.message}`
       );
+      // Extend cache expiration slightly to avoid repeated failures
+      cachedDomains.expiresAt = now + 5 * 60 * 1000; // 5 minutes
       return cachedDomains.items;
     }
-    // If no cached domains and fetch fails, throw
-    throw error;
+    // If no cached domains and fetch fails, log warning but return empty array
+    // This allows fallback to DEFAULT_PREFERRED_DOMAINS
+    console.warn(
+      `[Domain Fetch Error] No cached domains available. API error: ${error.message}. Will attempt to use default domains.`
+    );
+    return []; // Return empty array to allow fallback logic
   }
 };
 
@@ -242,12 +254,18 @@ const listDomainStrings = (entries) =>
 
 const pickMailTmDomain = async (preferredDomain) => {
   const domains = await getAvailableDomains();
-  if (!domains.length) {
-    throw new Error("No disposable domains available");
-  }
-  const domainStrings = listDomainStrings(domains);
+  let domainStrings = listDomainStrings(domains);
+
+  // Fallback to default preferred domains if API is unavailable
   if (!domainStrings.length) {
-    throw new Error("Domain list is empty");
+    console.warn(
+      `[Domain Fallback] No domains from API, using default preferred domains for selection.`
+    );
+    domainStrings = [...DEFAULT_PREFERRED_DOMAINS];
+  }
+
+  if (!domainStrings.length) {
+    throw new Error("No disposable domains available");
   }
 
   if (preferredDomain) {
@@ -292,9 +310,27 @@ const pickMailTmDomain = async (preferredDomain) => {
 const getAvailablePreferredDomains = async () => {
   const domains = await getAvailableDomains();
   const domainStrings = listDomainStrings(domains);
+
+  // If no domains from API, fall back to default preferred domains
+  if (domainStrings.length === 0) {
+    console.warn(
+      `[Domain Fallback] No domains from API, using default preferred domains list.`
+    );
+    return [...DEFAULT_PREFERRED_DOMAINS]; // Return a copy of default domains
+  }
+
   const preferred = domainStrings.filter((domain) =>
     DEFAULT_PREFERRED_DOMAINS.includes(domain.toLowerCase())
   );
+
+  // If no preferred domains found in API response, use default list as fallback
+  if (preferred.length === 0) {
+    console.warn(
+      `[Domain Fallback] No preferred domains found in API response, using default list.`
+    );
+    return [...DEFAULT_PREFERRED_DOMAINS]; // Return a copy of default domains
+  }
+
   // Sort consistently to maintain order
   return preferred.sort((a, b) =>
     a.toLowerCase().localeCompare(b.toLowerCase())
@@ -399,11 +435,27 @@ const provisionMailboxWithMailTm = async (preferredDomain) => {
   // Get available preferred domains
   const availablePreferred = await getAvailablePreferredDomains();
   const allDomains = await getAvailableDomains();
-  const allDomainStrings = listDomainStrings(allDomains);
+  let allDomainStrings = listDomainStrings(allDomains);
+
+  // Fallback to default domains if API is completely unavailable
+  if (!allDomainStrings.length && availablePreferred.length > 0) {
+    console.warn(
+      `[Domain Fallback] Using preferred domains list as API is unavailable.`
+    );
+    allDomainStrings = [...DEFAULT_PREFERRED_DOMAINS];
+  }
 
   // Get list of domains to try (preferred first)
   let domainsToTry =
     availablePreferred.length > 0 ? availablePreferred : allDomainStrings;
+
+  // Final fallback: if still no domains, use default list
+  if (!domainsToTry.length) {
+    console.warn(
+      `[Domain Fallback] All fallbacks failed, using default preferred domains list.`
+    );
+    domainsToTry = [...DEFAULT_PREFERRED_DOMAINS];
+  }
 
   // Sort domains consistently to maintain order (alphabetically)
   domainsToTry.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
@@ -477,8 +529,15 @@ const provisionMailboxWithMailTm = async (preferredDomain) => {
     domainsToTry.unshift(mailtm);
   }
 
+  // Final safety check: if somehow we still have no domains, use defaults
   if (domainsToTry.length === 0) {
-    throw new Error("No domains available");
+    console.error(
+      `[Domain Fallback] No domains available, using default list as last resort.`
+    );
+    domainsToTry = [...DEFAULT_PREFERRED_DOMAINS];
+    if (domainsToTry.length === 0) {
+      throw new Error("No domains available - configuration error");
+    }
   }
 
   // Try domains in rotation order, skipping rate-limited domains

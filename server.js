@@ -98,6 +98,9 @@ const mailTmRequest = async (
           "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
       } else if (response.status === 404) {
         messageFromRemote = "Requested resource not found. Please try again.";
+      } else if (response.status >= 500) {
+        messageFromRemote =
+          "Mailbox provider service error. Please try again in a few moments.";
       }
     } else if (
       lowerText.includes("not_found") ||
@@ -107,7 +110,18 @@ const mailTmRequest = async (
       // Normalize the message so frontend doesn't see raw HTML / opaque IDs
       messageFromRemote =
         "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
+    } else if (response.status >= 500) {
+      messageFromRemote =
+        "Mailbox provider service error. Please try again in a few moments.";
     }
+
+    // Log error details for debugging (server-side only)
+    console.error(`[mail.tm Error] ${pathFragment}`, {
+      status: response.status,
+      message: messageFromRemote,
+      hasData: !!data,
+      textSnippet: text ? text.slice(0, 100) : null,
+    });
 
     const error = new Error(messageFromRemote);
     error.status = response.status;
@@ -606,11 +620,18 @@ setInterval(() => {
 app.post("/api/mailboxes", async (req, res, next) => {
   try {
     const preferredDomain = req.body?.domain || null;
+    console.log(
+      `[Mailbox Creation Request] domain: ${preferredDomain || "none"}`
+    );
     const mailbox = await createMailbox(preferredDomain);
     console.log(`[Mailbox Created] ${mailbox.mailboxId} -> ${mailbox.address}`);
     res.status(201).json(buildMailboxResponse(mailbox));
   } catch (error) {
-    console.error("[Mailbox Creation Error]", error.message, error.status);
+    console.error("[Mailbox Creation Error]", {
+      message: error.message,
+      status: error.status,
+      stack: error.stack?.split("\n").slice(0, 5).join("\n"),
+    });
     next(error);
   }
 });
@@ -686,11 +707,27 @@ app.use((req, res) => {
 });
 
 // Error handler (must be last, has 4 parameters)
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   const status = err.status || 500;
 
   // Sanitize error messages to remove technical details like IDs
   let errorMessage = err.message || "Unexpected error";
+
+  // Handle mail.tm specific error messages
+  if (errorMessage.includes("mail.tm request failed")) {
+    const statusMatch = errorMessage.match(/\((\d+)\)/);
+    const errorStatus = statusMatch ? parseInt(statusMatch[1]) : status;
+
+    if (errorStatus >= 500) {
+      errorMessage =
+        "Mailbox provider service error. Please try again in a few moments.";
+    } else if (errorStatus === 404) {
+      errorMessage =
+        "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
+    } else {
+      errorMessage = "Unable to create mailbox at this time. Please try again.";
+    }
+  }
 
   // Remove technical error IDs and codes from error messages
   if (errorMessage.includes("ID:") || errorMessage.includes("Code:")) {
@@ -704,6 +741,17 @@ app.use((err, _req, res, _next) => {
       // Extract just the main error message, remove ID and Code lines
       errorMessage = errorMessage.split("\n")[0].replace(/^\d+:\s*/, "");
     }
+  }
+
+  // Log full error details server-side for debugging
+  if (status >= 500) {
+    console.error("[Server Error]", {
+      path: req.path,
+      method: req.method,
+      message: err.message,
+      status: err.status,
+      stack: err.stack?.split("\n").slice(0, 10).join("\n"),
+    });
   }
 
   res.status(status).json({

@@ -7,6 +7,7 @@ import { v4 as uuid } from "uuid";
 import dayjs from "dayjs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { existsSync } from "fs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -739,13 +740,20 @@ app.use(cors(corsOptions));
 app.use(express.json({ limit: "100kb" }));
 app.use(express.urlencoded({ extended: true, limit: "100kb" }));
 
-// Only serve static files in non-serverless environments
+// Serve static files - check if dist folder exists
+const staticPath = isProduction
+  ? path.join(__dirname, "dist")
+  : path.join(__dirname, "public");
 
-if (!isVercel) {
-  const staticPath = isProduction
-    ? path.join(__dirname, "dist")
-    : path.join(__dirname, "public");
+// Serve static files if directory exists (works on Vercel too)
+// On Vercel, dist folder should be in backend/dist
+if (existsSync(staticPath)) {
   app.use(express.static(staticPath));
+  if (isVercel) {
+    console.log(`[Vercel] Serving static files from: ${staticPath}`);
+  }
+} else if (isVercel) {
+  console.warn(`[Vercel] Static files directory not found: ${staticPath}`);
 }
 
 // Root endpoint
@@ -972,12 +980,21 @@ app.use((err, req, res, _next) => {
   });
 });
 
-// Only add catch-all route for static file serving in non-serverless production
-if (isProduction && !isVercel) {
-  // In Express 5 / path-to-regexp v6, bare "*" is not a valid path pattern.
-  // Use a catch-all pattern compatible with the newer matcher instead.
-  app.get("/*", (_req, res) => {
-    res.sendFile(path.join(__dirname, "dist", "index.html"));
+// Add catch-all route for SPA routing (works on Vercel too)
+if (isProduction) {
+  // Serve index.html for all non-API routes (SPA routing)
+  app.get("*", (req, res, next) => {
+    // Skip API routes
+    if (req.path.startsWith("/api/")) {
+      return next();
+    }
+    // Serve index.html for frontend routes
+    const indexPath = path.join(__dirname, "dist", "index.html");
+    if (existsSync(indexPath)) {
+      res.sendFile(indexPath);
+    } else {
+      next();
+    }
   });
 }
 

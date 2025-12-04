@@ -5,30 +5,79 @@ const API_BASE =
 
 export const api = {
   async createMailbox() {
-    const res = await fetch(`${API_BASE}/api/mailboxes`, { method: "POST" });
-    if (!res.ok) {
-      const errorText = await res.text();
-      let message = "Unable to create mailbox";
-      try {
-        const parsed = JSON.parse(errorText);
-        message = parsed?.error || parsed?.message || message;
-      } catch {
-        message = errorText || message;
+    try {
+      const res = await fetch(`${API_BASE}/api/mailboxes`, { method: "POST" });
+      if (!res.ok) {
+        const errorText = await res.text();
+        let message = "Unable to create mailbox";
+        try {
+          const parsed = JSON.parse(errorText);
+          message = parsed?.error || parsed?.message || message;
+        } catch {
+          message = errorText || message;
+        }
+        const error = new Error(message);
+        error.status = res.status;
+        throw error;
       }
-      throw new Error(message);
+      return res.json();
+    } catch (error) {
+      // Re-throw if it's already an Error with message
+      if (error instanceof Error) {
+        throw error;
+      }
+      // Handle network errors
+      throw new Error("Network error. Please check your connection and try again.");
     }
-    return res.json();
   },
   async getMessages(mailboxId) {
-    const res = await fetch(`${API_BASE}/api/mailboxes/${mailboxId}/messages`);
-    if (!res.ok) throw new Error("Unable to load inbox");
-    return res.json();
+    try {
+      const res = await fetch(`${API_BASE}/api/mailboxes/${mailboxId}/messages`);
+      if (!res.ok) {
+        const errorText = await res.text();
+        let message = "Unable to load inbox";
+        try {
+          const parsed = JSON.parse(errorText);
+          message = parsed?.error || parsed?.message || message;
+        } catch {
+          message = errorText || message;
+        }
+        const error = new Error(message);
+        error.status = res.status;
+        throw error;
+      }
+      return res.json();
+    } catch (error) {
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error("Network error. Please check your connection and try again.");
+    }
   },
   async extendMailbox(mailboxId) {
-    const res = await fetch(`${API_BASE}/api/mailboxes/${mailboxId}/extend`, {
-      method: "POST",
-    });
-    if (!res.ok) throw new Error("Unable to extend mailbox");
-    return res.json();
+    try {
+      const res = await fetch(`${API_BASE}/api/mailboxes/${mailboxId}/extend`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        const errorText = await res.text();
+        let message = "Unable to extend mailbox";
+        try {
+          const parsed = JSON.parse(errorText);
+          message = parsed?.error || parsed?.message || message;
+        } catch {
+          message = errorText || message;
+        }
+        const error = new Error(message);
+        error.status = res.status;
+        throw error;
+      }
+      return res.json();
+    } catch (error) {
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error("Network error. Please check your connection and try again.");
+    }
   },
 };

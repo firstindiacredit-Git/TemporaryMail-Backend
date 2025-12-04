@@ -86,13 +86,13 @@ const mailTmRequest = async (
       `mail.tm request failed (${response.status})`;
 
     const lowerText = (text || "").toLowerCase();
-    
+
     // Handle structured text errors with Code and ID fields
     if (text && !data) {
       // Check for structured error format like "404: NOT_FOUND\n\nCode: NOT_FOUND\n\nID: ..."
       const codeMatch = text.match(/Code:\s*(\w+)/i);
       const notFoundMatch = text.match(/NOT_FOUND/i);
-      
+
       if (codeMatch || notFoundMatch || lowerText.includes("not_found")) {
         messageFromRemote =
           "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
@@ -252,7 +252,7 @@ const fetchMailboxMessages = async (mailbox) => {
   const successfulMessages = detailed
     .filter((result) => result.status === "fulfilled")
     .map((result) => result.value);
-  
+
   const normalized = successfulMessages.map((message) => ({
     id: message.id,
     from: message.from?.address || message.from?.name || "unknown",
@@ -517,11 +517,25 @@ app.use(
 
 app.use(express.json({ limit: "100kb" }));
 
+// Only serve static files in non-serverless environments
+const isVercel = process.env.VERCEL === "1";
 const isProduction = process.env.NODE_ENV === "production";
-const staticPath = isProduction
-  ? path.join(__dirname, "dist")
-  : path.join(__dirname, "public");
-app.use(express.static(staticPath));
+
+if (!isVercel) {
+  const staticPath = isProduction
+    ? path.join(__dirname, "dist")
+    : path.join(__dirname, "public");
+  app.use(express.static(staticPath));
+}
+
+// Root endpoint
+app.get("/", (_req, res) => {
+  res.json({
+    message: "Temp Mail API",
+    status: "running",
+    version: "1.0.0",
+  });
+});
 
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", mailboxes: mailboxes.size });
@@ -653,32 +667,53 @@ app.post("/api/mailboxes/:mailboxId/extend", (req, res, next) => {
   }
 });
 
+// 404 handler for non-API routes (must come before error handler)
+app.use((req, res) => {
+  // In serverless environment, return JSON 404 for all non-matched routes
+  res.status(404).json({
+    error: "Not found",
+    status: 404,
+    message: "This is an API-only backend. Use /api/* endpoints.",
+    path: req.path,
+    availableEndpoints: [
+      "GET /api/health",
+      "POST /api/mailboxes",
+      "GET /api/mailboxes/:mailboxId",
+      "GET /api/mailboxes/:mailboxId/messages",
+      "POST /api/mailboxes/:mailboxId/extend",
+    ],
+  });
+});
+
+// Error handler (must be last, has 4 parameters)
 app.use((err, _req, res, _next) => {
   const status = err.status || 500;
-  
+
   // Sanitize error messages to remove technical details like IDs
   let errorMessage = err.message || "Unexpected error";
-  
+
   // Remove technical error IDs and codes from error messages
   if (errorMessage.includes("ID:") || errorMessage.includes("Code:")) {
     // If error contains structured format like "404: NOT_FOUND\n\nCode: NOT_FOUND\n\nID: ..."
     if (errorMessage.includes("NOT_FOUND") || status === 404) {
       errorMessage = "The requested resource was not found. Please try again.";
     } else if (errorMessage.toLowerCase().includes("not_found")) {
-      errorMessage = "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
+      errorMessage =
+        "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
     } else {
       // Extract just the main error message, remove ID and Code lines
       errorMessage = errorMessage.split("\n")[0].replace(/^\d+:\s*/, "");
     }
   }
-  
+
   res.status(status).json({
     error: errorMessage,
     status,
   });
 });
 
-if (isProduction) {
+// Only add catch-all route for static file serving in non-serverless production
+if (isProduction && !isVercel) {
   // In Express 5 / path-to-regexp v6, bare "*" is not a valid path pattern.
   // Use a catch-all pattern compatible with the newer matcher instead.
   app.get("/*", (_req, res) => {

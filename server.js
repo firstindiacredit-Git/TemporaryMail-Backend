@@ -686,7 +686,13 @@ if (isProduction) {
   });
 }
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Temp mail service listening on http://localhost:${PORT}`);
-});
+// Export for Vercel serverless functions
+export default app;
+
+// Start server only if not in serverless environment (local development)
+if (!process.env.VERCEL) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`Temp mail service listening on http://localhost:${PORT}`);
+  });
+}

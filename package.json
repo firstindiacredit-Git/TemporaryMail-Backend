@@ -12,7 +12,9 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "react": "^19.2.1",
-    "react-dom": "^19.2.1"
+    "cors": "^2.8.5",
+    "dayjs": "^1.11.19",
+    "express": "^5.1.0",
+    "uuid": "^13.0.0"
   }
 }

@@ -58,11 +58,13 @@ const mailboxes = new Map(); // mailboxId -> { address, domain, createdAt, expir
 
 const mailTmRequest = async (
   pathFragment,
-  { method = "GET", headers = {}, body, retries = 0, maxRetries = 2 } = {}
+  { method = "GET", headers = {}, body, retries = 0, maxRetries = 3 } = {}
 ) => {
   // Create timeout controller
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+  // Longer timeout for Vercel serverless functions (60 seconds max)
+  const timeoutMs = process.env.VERCEL ? 55000 : 30000; // 55s on Vercel (below 60s limit), 30s locally
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(`${MAIL_TM_BASE_URL}${pathFragment}`, {

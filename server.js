@@ -1,0 +1,655 @@
+import express from "express";
+import cors from "cors";
+import { v4 as uuid } from "uuid";
+import dayjs from "dayjs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+
+const MAILBOX_TTL_MINUTES = 15;
+const CLEANUP_INTERVAL_MS = 60 * 1000;
+const MAILBOX_LOCAL_PART_LENGTH = 10;
+const PASSWORD_LENGTH = 24;
+const MAIL_TM_BASE_URL = process.env.MAIL_TM_BASE_URL || "https://api.mail.tm";
+const DOMAIN_CACHE_TTL_MS = 10 * 60 * 1000;
+
+let domainRotationIndex = 0;
+const DEFAULT_PREFERRED_DOMAINS = [
+  "comfythings.com",
+  "elyxstore.com",
+  "ketoblisslabs.com",
+  "ekii.de",
+  "asia-mail.com",
+  "doer.sbs",
+  "badfist.com",
+  "besenica.com",
+  "mail.tm",
+];
+
+const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+const letters = "abcdefghijklmnopqrstuvwxyz";
+
+const generateIdentifier = (length) => {
+  let output = "";
+  for (let i = 0; i < length; i += 1) {
+    output += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return output;
+};
+
+const generateLocalPart = () => {
+  // First character must be a letter, rest can be letters or numbers
+  const firstChar = letters[Math.floor(Math.random() * letters.length)];
+  let rest = "";
+  for (let i = 0; i < MAILBOX_LOCAL_PART_LENGTH - 1; i += 1) {
+    rest += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return firstChar + rest;
+};
+const generatePassword = () => generateIdentifier(PASSWORD_LENGTH);
+
+let cachedDomains = { expiresAt: 0, items: [] };
+
+const mailboxes = new Map(); // mailboxId -> { address, domain, createdAt, expiresAt, token, tokenExpiresAt, password, accountId, lastMessageCount }
+
+const mailTmRequest = async (
+  pathFragment,
+  { method = "GET", headers = {}, body } = {}
+) => {
+  const response = await fetch(`${MAIL_TM_BASE_URL}${pathFragment}`, {
+    method,
+    headers: {
+      Accept: "application/ld+json",
+      ...(body ? { "Content-Type": "application/json" } : {}),
+      ...headers,
+    },
+    body,
+  });
+
+  const text = await response.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = null;
+  }
+
+  if (!response.ok) {
+    // Handle cases where mail.tm returns an HTML "NOT_FOUND" page instead of JSON
+    let messageFromRemote =
+      data?.detail ||
+      data?.message ||
+      `mail.tm request failed (${response.status})`;
+
+    const lowerText = (text || "").toLowerCase();
+    if (
+      lowerText.includes("not_found") ||
+      lowerText.includes("the page could not be found")
+    ) {
+      // Normalize the message so frontend doesn't see raw HTML / opaque IDs
+      messageFromRemote =
+        "Mailbox provider is temporarily unavailable (NOT_FOUND). Please try again in a few seconds.";
+    }
+
+    const error = new Error(messageFromRemote);
+    error.status = response.status;
+    error.data = data;
+    // Preserve a small snippet of the raw body for server-side debugging
+    if (!data && text) {
+      error.rawBodySnippet = text.slice(0, 200);
+    }
+    throw error;
+  }
+
+  return data;
+};
+
+const getAvailableDomains = async () => {
+  const now = Date.now();
+  if (cachedDomains.items.length && cachedDomains.expiresAt > now) {
+    return cachedDomains.items;
+  }
+  const payload = await mailTmRequest("/domains");
+  const domains = payload?.["hydra:member"] || [];
+  cachedDomains = {
+    items: domains,
+    expiresAt: now + DOMAIN_CACHE_TTL_MS,
+  };
+  return domains;
+};
+
+const normalizeDomainEntry = (entry) => {
+  if (!entry) return null;
+  if (typeof entry === "string") return entry;
+  return entry.domain || entry.name || entry.address || null;
+};
+
+const listDomainStrings = (entries) =>
+  entries
+    .map((entry) => normalizeDomainEntry(entry))
+    .filter((domain) => typeof domain === "string");
+
+const pickMailTmDomain = async (preferredDomain) => {
+  const domains = await getAvailableDomains();
+  if (!domains.length) {
+    throw new Error("No disposable domains available");
+  }
+  const domainStrings = listDomainStrings(domains);
+  if (!domainStrings.length) {
+    throw new Error("Domain list is empty");
+  }
+
+  if (preferredDomain) {
+    const normalizedPreferred = preferredDomain.toLowerCase();
+    const match = domainStrings.find(
+      (domain) => domain.toLowerCase() === normalizedPreferred
+    );
+    if (!match) {
+      const error = new Error(
+        `Requested domain "${preferredDomain}" is not available. Try one of: ${domainStrings.join(
+          ", "
+        )}`
+      );
+      error.status = 422;
+      error.availableDomains = domainStrings;
+      throw error;
+    }
+    return match;
+  }
+
+  // Find all available preferred domains
+  const availablePreferred = domainStrings.filter((domain) =>
+    DEFAULT_PREFERRED_DOMAINS.includes(domain.toLowerCase())
+  );
+
+  if (availablePreferred.length > 0) {
+    // Use round-robin rotation to ensure different domains are used
+    const selectedDomain =
+      availablePreferred[domainRotationIndex % availablePreferred.length];
+    domainRotationIndex = (domainRotationIndex + 1) % availablePreferred.length;
+    return selectedDomain;
+  }
+
+  // If no preferred domains, rotate through all available domains
+  const selectedDomain =
+    domainStrings[domainRotationIndex % domainStrings.length];
+  domainRotationIndex = (domainRotationIndex + 1) % domainStrings.length;
+  return selectedDomain;
+};
+
+// Get all available preferred domains for rotation
+const getAvailablePreferredDomains = async () => {
+  const domains = await getAvailableDomains();
+  const domainStrings = listDomainStrings(domains);
+  const preferred = domainStrings.filter((domain) =>
+    DEFAULT_PREFERRED_DOMAINS.includes(domain.toLowerCase())
+  );
+  // Sort consistently to maintain order
+  return preferred.sort((a, b) =>
+    a.toLowerCase().localeCompare(b.toLowerCase())
+  );
+};
+
+const authenticateMailTm = async (address, password) => {
+  const body = JSON.stringify({ address, password });
+  const data = await mailTmRequest("/token", { method: "POST", body });
+  const expiresIn = Number(data?.expires_in) || 3600;
+  return {
+    token: data?.token,
+    refreshToken: data?.refresh_token || null,
+    tokenExpiresAt: dayjs().add(expiresIn, "second").toISOString(),
+  };
+};
+
+const ensureMailTmToken = async (mailbox) => {
+  if (mailbox.token && dayjs().isBefore(mailbox.tokenExpiresAt)) {
+    return mailbox.token;
+  }
+  const auth = await authenticateMailTm(mailbox.address, mailbox.password);
+  mailbox.token = auth.token;
+  mailbox.refreshToken = auth.refreshToken;
+  mailbox.tokenExpiresAt = auth.tokenExpiresAt;
+  return mailbox.token;
+};
+
+const fetchMailboxMessages = async (mailbox) => {
+  const token = await ensureMailTmToken(mailbox);
+  const list = await mailTmRequest("/messages?limit=25&sort=-createdAt", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const members = list?.["hydra:member"] || [];
+  if (!members.length) {
+    mailbox.lastMessageCount = 0;
+    return [];
+  }
+  const detailed = await Promise.all(
+    members.map((item) =>
+      mailTmRequest(`/messages/${item.id}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+    )
+  );
+  const normalized = detailed.map((message) => ({
+    id: message.id,
+    from: message.from?.address || message.from?.name || "unknown",
+    subject: message.subject || "(no subject)",
+    body: message.text || message.intro || "",
+    html: Array.isArray(message.html)
+      ? message.html.join("")
+      : message.html || "",
+    intro: message.intro,
+    seen: message.seen,
+    receivedAt: message.createdAt,
+  }));
+  mailbox.lastMessageCount = normalized.length;
+  return normalized;
+};
+
+const provisionMailboxWithMailTm = async (preferredDomain) => {
+  // If specific domain requested, use it
+  if (preferredDomain) {
+    const domain = await pickMailTmDomain(preferredDomain);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const localPart = generateLocalPart();
+      const address = `${localPart}@${domain}`;
+      const password = generatePassword();
+      try {
+        const account = await mailTmRequest("/accounts", {
+          method: "POST",
+          body: JSON.stringify({ address, password }),
+        });
+        const auth = await authenticateMailTm(address, password);
+        const actualDomain = address.split("@")[1] || domain;
+        return {
+          accountId: account.id,
+          address,
+          domain: actualDomain,
+          password,
+          token: auth.token,
+          tokenExpiresAt: auth.tokenExpiresAt,
+          refreshToken: auth.refreshToken,
+        };
+      } catch (error) {
+        if ([400, 409, 422].includes(error.status)) {
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw new Error("Unable to allocate mailbox at this time");
+  }
+
+  // Get available preferred domains
+  const availablePreferred = await getAvailablePreferredDomains();
+  const allDomains = await getAvailableDomains();
+  const allDomainStrings = listDomainStrings(allDomains);
+
+  // Get list of domains to try (preferred first)
+  let domainsToTry =
+    availablePreferred.length > 0 ? availablePreferred : allDomainStrings;
+
+  // Sort domains consistently to maintain order (alphabetically)
+  domainsToTry.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+
+  // Ensure comfythings.com is first in the list if available
+  const comfythingsIndex = domainsToTry.findIndex(
+    (d) => d.toLowerCase() === "comfythings.com"
+  );
+  if (comfythingsIndex >= 0) {
+    const comfythings = domainsToTry.splice(comfythingsIndex, 1)[0];
+    domainsToTry.unshift(comfythings);
+  }
+  const badfistIndex = domainsToTry.findIndex(
+    (d) => d.toLowerCase() === "badfist.com"
+  );
+  if (badfistIndex >= 0) {
+    const badfist = domainsToTry.splice(badfistIndex, 1)[0];
+    domainsToTry.unshift(badfist);
+  }
+
+  const besenicaIndex = domainsToTry.findIndex(
+    (d) => d.toLowerCase() === "besenica.com"
+  );
+  if (besenicaIndex >= 0) {
+    const besenica = domainsToTry.splice(besenicaIndex, 1)[0];
+    domainsToTry.unshift(besenica);
+  }
+
+  const asiamailIndex = domainsToTry.findIndex(
+    (d) => d.toLowerCase() === "asia-mail.com"
+  );
+  if (asiamailIndex >= 0) {
+    const asiamail = domainsToTry.splice(asiamailIndex, 1)[0];
+    domainsToTry.unshift(asiamail);
+  }
+
+  const doerIndex = domainsToTry.findIndex(
+    (d) => d.toLowerCase() === "doer.sbs"
+  );
+  if (doerIndex >= 0) {
+    const doer = domainsToTry.splice(doerIndex, 1)[0];
+    domainsToTry.unshift(doer);
+  }
+
+  const ekiiIndex = domainsToTry.findIndex(
+    (d) => d.toLowerCase() === "ekii.de"
+  );
+  if (ekiiIndex >= 0) {
+    const ekii = domainsToTry.splice(ekiiIndex, 1)[0];
+    domainsToTry.unshift(ekii);
+  }
+  const ketoblisslabsIndex = domainsToTry.findIndex(
+    (d) => d.toLowerCase() === "ketoblisslabs.com"
+  );
+  if (ketoblisslabsIndex >= 0) {
+    const ketoblisslabs = domainsToTry.splice(ketoblisslabsIndex, 1)[0];
+    domainsToTry.unshift(ketoblisslabs);
+  }
+  const elyxstoreIndex = domainsToTry.findIndex(
+    (d) => d.toLowerCase() === "elyxstore.com"
+  );
+  if (elyxstoreIndex >= 0) {
+    const elyxstore = domainsToTry.splice(elyxstoreIndex, 1)[0];
+    domainsToTry.unshift(elyxstore);
+  }
+  const mailtmIndex = domainsToTry.findIndex(
+    (d) => d.toLowerCase() === "mail.tm"
+  );
+  if (mailtmIndex >= 0) {
+    const mailtm = domainsToTry.splice(mailtmIndex, 1)[0];
+    domainsToTry.unshift(mailtm);
+  }
+
+  if (domainsToTry.length === 0) {
+    throw new Error("No domains available");
+  }
+
+  // Try domains in rotation order, skipping rate-limited domains
+  const maxDomainsToTry = Math.min(domainsToTry.length, 15); // Try up to 15 different domains
+  let startIndex = domainRotationIndex % domainsToTry.length;
+  let rateLimitedDomains = 0;
+
+  // Log for debugging
+  console.log(
+    `[Domain Rotation] Starting at index: ${startIndex}, Total domains: ${domainsToTry.length}`
+  );
+
+  // Try multiple domains if rate limited
+  for (let domainOffset = 0; domainOffset < maxDomainsToTry; domainOffset++) {
+    const currentIndex = (startIndex + domainOffset) % domainsToTry.length;
+    const domain = domainsToTry[currentIndex];
+
+    console.log(
+      `[Domain Rotation] Trying domain ${
+        domainOffset + 1
+      }/${maxDomainsToTry}: ${domain}`
+    );
+
+    // Try this domain up to 2 times (reduced from 3 to fail faster and try next)
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const localPart = generateLocalPart();
+      const address = `${localPart}@${domain}`;
+      const password = generatePassword();
+
+      try {
+        const account = await mailTmRequest("/accounts", {
+          method: "POST",
+          body: JSON.stringify({ address, password }),
+        });
+        const auth = await authenticateMailTm(address, password);
+        const actualDomain = address.split("@")[1] || domain;
+
+        // Increment rotation for next request (so next request gets next domain)
+        domainRotationIndex = (domainRotationIndex + 1) % domainsToTry.length;
+
+        console.log(
+          `[Domain Rotation] Success with domain: ${domain}, Next index: ${domainRotationIndex}`
+        );
+
+        return {
+          accountId: account.id,
+          address,
+          domain: actualDomain,
+          password,
+          token: auth.token,
+          tokenExpiresAt: auth.tokenExpiresAt,
+          refreshToken: auth.refreshToken,
+        };
+      } catch (error) {
+        // If rate limited (429), add delay and try next domain
+        if (error.status === 429) {
+          rateLimitedDomains++;
+          console.log(
+            `[Domain Rotation] Rate limited (429) on ${domain} (${rateLimitedDomains} rate-limited so far), trying next domain...`
+          );
+
+          // Add small delay before trying next domain (100-300ms random)
+          if (domainOffset < maxDomainsToTry - 1) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, 100 + Math.random() * 200)
+            );
+          }
+          break; // Break inner loop, try next domain
+        }
+
+        // If domain-specific error (422 with rate message), try next domain
+        if (
+          error.status === 422 &&
+          (error.data?.detail?.includes("rate") ||
+            error.data?.detail?.includes("limit") ||
+            error.data?.message?.includes("rate") ||
+            error.data?.message?.includes("limit"))
+        ) {
+          rateLimitedDomains++;
+          console.log(
+            `[Domain Rotation] Domain limit reached (422) on ${domain} (${rateLimitedDomains} rate-limited so far), trying next domain...`
+          );
+
+          // Add small delay before trying next domain
+          if (domainOffset < maxDomainsToTry - 1) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, 100 + Math.random() * 200)
+            );
+          }
+          break;
+        }
+
+        if ([400, 409].includes(error.status)) {
+          if (attempt < 1) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          continue;
+        }
+
+        console.log(
+          `[Domain Rotation] Error ${error.status} on ${domain}, trying next domain...`
+        );
+        break;
+      }
+    }
+  }
+
+  domainRotationIndex = (domainRotationIndex + 1) % domainsToTry.length;
+
+  const errorMessage =
+    rateLimitedDomains >= maxDomainsToTry - 2
+      ? "Unable to allocate mailbox. All domains are currently rate-limited. Please wait a few seconds and try again."
+      : "Unable to allocate mailbox at this time. Please try again in a few moments.";
+
+  console.error(
+    `[Domain Rotation] Failed after trying ${maxDomainsToTry} domains. ${rateLimitedDomains} were rate-limited.`
+  );
+  throw new Error(errorMessage);
+};
+
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-API-Key"],
+    credentials: false,
+  })
+);
+
+app.use(express.json({ limit: "100kb" }));
+
+const isProduction = process.env.NODE_ENV === "production";
+const staticPath = isProduction
+  ? path.join(__dirname, "dist")
+  : path.join(__dirname, "public");
+app.use(express.static(staticPath));
+
+app.get("/api/health", (_req, res) => {
+  res.json({ status: "ok", mailboxes: mailboxes.size });
+});
+
+const buildMailboxResponse = (mailbox) => ({
+  mailboxId: mailbox.mailboxId,
+  address: mailbox.address,
+  domain: mailbox.domain,
+  createdAt: mailbox.createdAt,
+  expiresAt: mailbox.expiresAt,
+  messageCount: mailbox.lastMessageCount || 0,
+});
+
+const ensureMailbox = (mailboxId) => {
+  const mailbox = mailboxes.get(mailboxId);
+  if (!mailbox) {
+    console.warn(
+      `[Mailbox Not Found] ${mailboxId} (total mailboxes: ${mailboxes.size})`
+    );
+    const error = new Error("Mailbox not found or expired");
+    error.status = 404;
+    throw error;
+  }
+  if (dayjs().isAfter(mailbox.expiresAt)) {
+    mailboxes.delete(mailboxId);
+    console.log(`[Mailbox Expired] ${mailboxId}`);
+    const error = new Error("Mailbox expired");
+    error.status = 410;
+    throw error;
+  }
+  return mailbox;
+};
+
+const createMailbox = async (preferredDomain) => {
+  const remote = await provisionMailboxWithMailTm(preferredDomain);
+  const mailboxId = uuid();
+  const createdAt = dayjs().toISOString();
+  const expiresAt = dayjs(createdAt)
+    .add(MAILBOX_TTL_MINUTES, "minute")
+    .toISOString();
+  const mailbox = {
+    mailboxId,
+    address: remote.address,
+    domain: remote.domain,
+    createdAt,
+    expiresAt,
+    password: remote.password,
+    accountId: remote.accountId,
+    token: remote.token,
+    tokenExpiresAt: remote.tokenExpiresAt,
+    refreshToken: remote.refreshToken,
+    lastMessageCount: 0,
+  };
+  mailboxes.set(mailboxId, mailbox);
+  return mailbox;
+};
+
+setInterval(() => {
+  const now = dayjs();
+  mailboxes.forEach((mailbox, mailboxId) => {
+    if (now.isAfter(mailbox.expiresAt)) {
+      mailboxes.delete(mailboxId);
+    }
+  });
+}, CLEANUP_INTERVAL_MS).unref();
+
+app.post("/api/mailboxes", async (req, res, next) => {
+  try {
+    const preferredDomain = req.body?.domain || null;
+    const mailbox = await createMailbox(preferredDomain);
+    console.log(`[Mailbox Created] ${mailbox.mailboxId} -> ${mailbox.address}`);
+    res.status(201).json(buildMailboxResponse(mailbox));
+  } catch (error) {
+    console.error("[Mailbox Creation Error]", error.message, error.status);
+    next(error);
+  }
+});
+
+app.get("/api/mailboxes/:mailboxId", (req, res, next) => {
+  try {
+    const mailbox = ensureMailbox(req.params.mailboxId);
+    res.json(buildMailboxResponse(mailbox));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/mailboxes/:mailboxId/messages", async (req, res, next) => {
+  try {
+    const mailbox = ensureMailbox(req.params.mailboxId);
+    const messages = await fetchMailboxMessages(mailbox);
+    res.json({
+      mailbox: buildMailboxResponse(mailbox),
+      messages,
+    });
+  } catch (error) {
+    console.error(
+      `[Messages Fetch Error] ${req.params.mailboxId}:`,
+      error.message,
+      error.status
+    );
+    next(error);
+  }
+});
+
+app.post("/api/mailboxes/:mailboxId/messages", (req, res, next) => {
+  try {
+    ensureMailbox(req.params.mailboxId);
+    res.status(501).json({
+      error:
+        "Sending emails via API is not supported. Send from any email client to this address.",
+      status: 501,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/mailboxes/:mailboxId/extend", (req, res, next) => {
+  try {
+    const mailbox = ensureMailbox(req.params.mailboxId);
+    mailbox.expiresAt = dayjs()
+      .add(MAILBOX_TTL_MINUTES, "minute")
+      .toISOString();
+    res.json(buildMailboxResponse(mailbox));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.use((err, _req, res, _next) => {
+  const status = err.status || 500;
+  res.status(status).json({
+    error: err.message || "Unexpected error",
+    status,
+  });
+});
+
+if (isProduction) {
+  // In Express 5 / path-to-regexp v6, bare "*" is not a valid path pattern.
+  // Use a catch-all pattern compatible with the newer matcher instead.
+  app.get("/*", (_req, res) => {
+    res.sendFile(path.join(__dirname, "dist", "index.html"));
+  });
+}
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Temp mail service listening on http://localhost:${PORT}`);
+});

@@ -86,13 +86,27 @@ const mailTmRequest = async (
       `mail.tm request failed (${response.status})`;
 
     const lowerText = (text || "").toLowerCase();
-    if (
+    
+    // Handle structured text errors with Code and ID fields
+    if (text && !data) {
+      // Check for structured error format like "404: NOT_FOUND\n\nCode: NOT_FOUND\n\nID: ..."
+      const codeMatch = text.match(/Code:\s*(\w+)/i);
+      const notFoundMatch = text.match(/NOT_FOUND/i);
+      
+      if (codeMatch || notFoundMatch || lowerText.includes("not_found")) {
+        messageFromRemote =
+          "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
+      } else if (response.status === 404) {
+        messageFromRemote = "Requested resource not found. Please try again.";
+      }
+    } else if (
       lowerText.includes("not_found") ||
-      lowerText.includes("the page could not be found")
+      lowerText.includes("the page could not be found") ||
+      data?.code === "NOT_FOUND"
     ) {
       // Normalize the message so frontend doesn't see raw HTML / opaque IDs
       messageFromRemote =
-        "Mailbox provider is temporarily unavailable (NOT_FOUND). Please try again in a few seconds.";
+        "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
     }
 
     const error = new Error(messageFromRemote);
@@ -226,14 +240,20 @@ const fetchMailboxMessages = async (mailbox) => {
     mailbox.lastMessageCount = 0;
     return [];
   }
-  const detailed = await Promise.all(
+  // Fetch detailed messages, handling individual message errors gracefully
+  const detailed = await Promise.allSettled(
     members.map((item) =>
       mailTmRequest(`/messages/${item.id}`, {
         headers: { Authorization: `Bearer ${token}` },
       })
     )
   );
-  const normalized = detailed.map((message) => ({
+  // Filter out failed requests and map successful ones
+  const successfulMessages = detailed
+    .filter((result) => result.status === "fulfilled")
+    .map((result) => result.value);
+  
+  const normalized = successfulMessages.map((message) => ({
     id: message.id,
     from: message.from?.address || message.from?.name || "unknown",
     subject: message.subject || "(no subject)",
@@ -635,8 +655,25 @@ app.post("/api/mailboxes/:mailboxId/extend", (req, res, next) => {
 
 app.use((err, _req, res, _next) => {
   const status = err.status || 500;
+  
+  // Sanitize error messages to remove technical details like IDs
+  let errorMessage = err.message || "Unexpected error";
+  
+  // Remove technical error IDs and codes from error messages
+  if (errorMessage.includes("ID:") || errorMessage.includes("Code:")) {
+    // If error contains structured format like "404: NOT_FOUND\n\nCode: NOT_FOUND\n\nID: ..."
+    if (errorMessage.includes("NOT_FOUND") || status === 404) {
+      errorMessage = "The requested resource was not found. Please try again.";
+    } else if (errorMessage.toLowerCase().includes("not_found")) {
+      errorMessage = "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
+    } else {
+      // Extract just the main error message, remove ID and Code lines
+      errorMessage = errorMessage.split("\n")[0].replace(/^\d+:\s*/, "");
+    }
+  }
+  
   res.status(status).json({
-    error: err.message || "Unexpected error",
+    error: errorMessage,
     status,
   });
 });

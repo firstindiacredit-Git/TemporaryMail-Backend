@@ -8,6 +8,26 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Handle unhandled promise rejections globally
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[Unhandled Rejection]", {
+    reason: reason?.message || String(reason),
+    stack: reason?.stack?.split("\n").slice(0, 5).join("\n"),
+  });
+});
+
+// Handle uncaught exceptions
+process.on("uncaughtException", (error) => {
+  console.error("[Uncaught Exception]", {
+    message: error.message,
+    stack: error.stack?.split("\n").slice(0, 5).join("\n"),
+  });
+  // Don't exit in serverless - let Vercel handle it
+  if (!process.env.VERCEL) {
+    process.exit(1);
+  }
+});
+
 const app = express();
 
 const MAILBOX_TTL_MINUTES = 15;
@@ -696,14 +716,18 @@ const createMailbox = async (preferredDomain) => {
   return mailbox;
 };
 
-setInterval(() => {
-  const now = dayjs();
-  mailboxes.forEach((mailbox, mailboxId) => {
-    if (now.isAfter(mailbox.expiresAt)) {
-      mailboxes.delete(mailboxId);
-    }
-  });
-}, CLEANUP_INTERVAL_MS).unref();
+// Only run cleanup interval in non-serverless environments
+// Serverless functions don't maintain state between invocations
+if (!process.env.VERCEL) {
+  setInterval(() => {
+    const now = dayjs();
+    mailboxes.forEach((mailbox, mailboxId) => {
+      if (now.isAfter(mailbox.expiresAt)) {
+        mailboxes.delete(mailboxId);
+      }
+    });
+  }, CLEANUP_INTERVAL_MS).unref();
+}
 
 app.post("/api/mailboxes", async (req, res, next) => {
   try {
@@ -801,33 +825,38 @@ app.use((err, req, res, _next) => {
   // Sanitize error messages to remove technical details like IDs
   let errorMessage = err.message || "Unexpected error";
 
-  // Handle mail.tm specific error messages
-  if (errorMessage.includes("mail.tm request failed")) {
-    const statusMatch = errorMessage.match(/\((\d+)\)/);
-    const errorStatus = statusMatch ? parseInt(statusMatch[1]) : status;
+  // For 500 errors, ALWAYS return the user-friendly message first
+  if (status >= 500) {
+    errorMessage =
+      "Mailbox provider service error. Please try again in a few moments.";
+  } else {
+    // Handle mail.tm specific error messages for non-500 errors
+    if (errorMessage.includes("mail.tm request failed")) {
+      const statusMatch = errorMessage.match(/\((\d+)\)/);
+      const errorStatus = statusMatch ? parseInt(statusMatch[1]) : status;
 
-    if (errorStatus >= 500) {
-      errorMessage =
-        "Mailbox provider service error. Please try again in a few moments.";
-    } else if (errorStatus === 404) {
-      errorMessage =
-        "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
-    } else {
-      errorMessage = "Unable to create mailbox at this time. Please try again.";
+      if (errorStatus === 404) {
+        errorMessage =
+          "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
+      } else {
+        errorMessage =
+          "Unable to create mailbox at this time. Please try again.";
+      }
     }
-  }
 
-  // Remove technical error IDs and codes from error messages
-  if (errorMessage.includes("ID:") || errorMessage.includes("Code:")) {
-    // If error contains structured format like "404: NOT_FOUND\n\nCode: NOT_FOUND\n\nID: ..."
-    if (errorMessage.includes("NOT_FOUND") || status === 404) {
-      errorMessage = "The requested resource was not found. Please try again.";
-    } else if (errorMessage.toLowerCase().includes("not_found")) {
-      errorMessage =
-        "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
-    } else {
-      // Extract just the main error message, remove ID and Code lines
-      errorMessage = errorMessage.split("\n")[0].replace(/^\d+:\s*/, "");
+    // Remove technical error IDs and codes from error messages
+    if (errorMessage.includes("ID:") || errorMessage.includes("Code:")) {
+      // If error contains structured format like "404: NOT_FOUND\n\nCode: NOT_FOUND\n\nID: ..."
+      if (errorMessage.includes("NOT_FOUND") || status === 404) {
+        errorMessage =
+          "The requested resource was not found. Please try again.";
+      } else if (errorMessage.toLowerCase().includes("not_found")) {
+        errorMessage =
+          "Mailbox provider is temporarily unavailable. Please try again in a few seconds.";
+      } else {
+        // Extract just the main error message, remove ID and Code lines
+        errorMessage = errorMessage.split("\n")[0].replace(/^\d+:\s*/, "");
+      }
     }
   }
 
